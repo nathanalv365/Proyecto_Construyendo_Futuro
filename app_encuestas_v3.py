@@ -1,695 +1,576 @@
 import streamlit as st
 import pandas as pd
 import json
-import io
-import datetime
 from PIL import Image
+import io
+from datetime import datetime
 import plotly.express as px
 import plotly.graph_objects as go
 
-# Configuración de compatibilidad para Google Gemini SDK
-try:
-    from google import genai
-    from google.genai import types
-    USE_NEW_SDK = True
-except ImportError:
-    try:
-        import google.generativeai as genai
-        USE_NEW_SDK = False
-    except ImportError:
-        st.error("No se encontraron las librerías de Google Gemini. Por favor instala google-generativeai en tu entorno.")
-
-# Configuración de Google Sheets
+# Intentar importar librerías de Google Sheets
 try:
     import gspread
     from oauth2client.service_account import ServiceAccountCredentials
-    GSPREAD_AVAILABLE = True
+    G_SHEETS_AVAILABLE = True
 except ImportError:
-    GSPREAD_AVAILABLE = False
+    G_SHEETS_AVAILABLE = False
 
+# Intentar importar librerías de Gemini
+GEMINI_LIB = None
+try:
+    from google import genai
+    from google.genai import types
+    GEMINI_LIB = "genai"
+except ImportError:
+    try:
+        import google.generativeai as google_genai
+        GEMINI_LIB = "generativeai"
+    except ImportError:
+        GEMINI_LIB = None
+
+# ==========================================================
+# CONFIGURACIÓN DE PÁGINA Y DISEÑO CSS (CORREGIDO)
+# ==========================================================
 st.set_page_config(
     page_title="Proyecto Construyendo Futuro - SRPA",
-    page_icon="📊",
+    page_icon="📱",
     layout="wide",
-    initial_sidebar_state="collapsed"
+    initial_sidebar_state="expanded"
 )
 
-# --- CONFIGURACIÓN DE ESTILOS CSS PARA DISPOSITIVOS MÓVILES ---
+# Estilo CSS personalizado para celulares e interfaz moderna
 st.markdown("""
 <style>
-    /* Estilos móviles optimizados */
-    .block-container {
-        padding-top: 1.5rem;
-        padding-bottom: 2rem;
-        padding-left: 1rem;
-        padding-right: 1rem;
+    .main {
+        background-color: #f8fafc;
     }
     .stButton>button {
         width: 100%;
-        border-radius: 12px;
-        font-weight: 600;
-        padding: 0.6rem 1rem;
-    }
-    .stTabs [data-baseweb="tab-list"] {
-        gap: 8px;
-    }
-    .stTabs [data-baseweb="tab"] {
-        height: 50px;
-        white-space: pre-wrap;
-        background-color: #f1f5f9;
         border-radius: 8px;
-        padding: 10px 16px;
-        font-size: 14px;
-        font-weight: 500;
+        font-weight: 600;
     }
-    .stTabs [aria-selected="true"] {
-        background-color: #2563eb !important;
-        color: white !important;
+    .success-box {
+        padding: 15px;
+        background-color: #f0fdf4;
+        border-left: 5px solid #16a34a;
+        border-radius: 4px;
+        color: #14532d;
+        margin-bottom: 15px;
     }
-    .kpi-card {
+    .warning-box {
+        padding: 15px;
+        background-color: #fffbeb;
+        border-left: 5px solid #d97706;
+        border-radius: 4px;
+        color: #78350f;
+        margin-bottom: 15px;
+    }
+    .error-box {
+        padding: 15px;
+        background-color: #fef2f2;
+        border-left: 5px solid #dc2626;
+        border-radius: 4px;
+        color: #7f1d1d;
+        margin-bottom: 15px;
+    }
+    .card {
+        padding: 20px;
         background-color: #ffffff;
+        border-radius: 10px;
+        box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+        margin-bottom: 20px;
         border: 1px solid #e2e8f0;
-        padding: 1.2rem;
-        border-radius: 16px;
-        text-align: center;
-        box-shadow: 0 4px 6px -1px rgb(0 0 0 / 0.05);
+    }
+    h1, h2, h3 {
+        color: #1e293b;
     }
 </style>
-""", unsafe_allowed_value=True)
+""", unsafe_allow_html=True) # <-- AQUÍ ESTÁ LA CORRECCIÓN CRÍTICA
 
-# --- PROMPT OCR CONFIGURATION ---
-SYSTEM_PROMPT = """
-Eres un analizador OCR experto para el "Proyecto Construyendo Futuro" (SRPA).
-Analiza las dos imágenes proporcionadas correspondientes a la Página 1 y Página 2 de un mismo cuestionario.
-Extrae la información en formato JSON estricto sin preámbulos ni explicaciones.
-
-Reglas importantes de extracción:
-1. Identifica si el formulario es "PRETEST" o "POSTEST" buscando el título superior en la Página 1.
-2. Lee los datos manuscritos del encabezado (Página 1):
-   - Fecha (Intenta estandarizar a YYYY-MM-DD, p.ej. "30/07/2026" -> "2026-07-30")
-   - Municipio (p.ej. "Cartagena")
-   - Institución Educativa (Busca el texto escrito en la línea, p.ej. "Promesa de Dios")
-   - Rol del participante (Marca con una X la opción correspondiente: Estudiante, Docente, Padre de Familia, Lider comunitario)
-3. Lee las respuestas de las preguntas de conocimientos marcadas con (X) en ambas páginas:
-   - Para PRETEST: Extrae respuestas para las preguntas de conocimientos 1 a 8.
-   - Para POSTEST: Sección A de conocimientos contiene preguntas 1 a 5.
-   - Si una pregunta de conocimientos no tiene respuesta o está en blanco, DEVUELVE la cadena vacía "". No inventes respuestas.
-4. Para POSTEST: Lee la SECCIÓN B (Evaluación de satisfacción, preguntas 1 a 9).
-   - Registra el valor de la opción marcada con (X) ("Excelente", "Bueno", "Regular", "Deficiente").
-   - Si está en blanco o sin marcar, devuelve "". No inventes respuestas.
-
-Esquema JSON obligatorio de salida:
-{
-  "tipo_formulario": "PRETEST" o "POSTEST",
-  "encabezado": {
-    "fecha": "YYYY-MM-DD",
-    "municipio": "Nombre Municipio",
-    "institucion_educativa_ia": "Nombre manuscrito detectado de la Institución",
-    "rol": "Estudiante" | "Docente" | "Padre de Familia" | "Lider comunitario"
-  },
-  "conocimientos": {
-    "p1": "a"|"b"|"c"|"",
-    "p2": "a"|"b"|"c"|"d"|"",
-    ...
-    "p8": "a"|"b"|"c"|"d"|"" (solo si es PRETEST)
-  },
-  "satisfaccion": { (Solo si es POSTEST, si es PRETEST este bloque debe estar vacío o ser null)
-    "sat_1": "Excelente"|"Bueno"|"Regular"|"Deficiente"|"",
-    ...
-    "sat_9": "Excelente"|"Bueno"|"Regular"|"Deficiente"|""
-  }
-}
-"""
-
-# --- CONEXIÓN A GOOGLE SHEETS ---
-def conectar_google_sheets():
-    """Establece conexión con Google Sheets usando secretos de Streamlit."""
-    if not GSPREAD_AVAILABLE:
-        st.error("Librerías de Google Sheets no disponibles en el entorno.")
-        return None
+# ==========================================================
+# CONEXIÓN CON GOOGLE SHEETS
+# ==========================================================
+def obtener_cliente_sheets():
+    if not G_SHEETS_AVAILABLE:
+        return None, "Librerías de Google Sheets no instaladas en el servidor."
     
     if "gcp_service_account" not in st.secrets:
-        # Mostrar panel instructivo interactivo si no está configurado
-        st.info("ℹ️ Conexión con Google Sheets no configurada.")
-        with st.expander("🛠️ Ver Instrucciones de Configuración", expanded=True):
-            st.markdown("""
-            ### Cómo conectar tu Google Sheet central en 3 pasos:
-            1. **Crea un proyecto en Google Cloud Console** y activa las APIs de **Google Sheets** y **Google Drive**.
-            2. Crea una **Cuenta de Servicio**, descarga la llave en formato **JSON** y compártela con tu hoja de cálculo dándole permisos de **Editor** al correo de la cuenta de servicio.
-            3. Ve al panel de control de **Streamlit Cloud** -> **Settings** -> **Secrets** y pega tus credenciales así:
-            ```toml
-            GEMINI_API_KEY = "tu-clave-api"
-            
-            [gcp_service_account]
-            type = "service_account"
-            project_id = "tu-proyecto-id"
-            private_key = "-----BEGIN PRIVATE KEY-----\\nTU_LLAVE_PRIVADA\\n-----END PRIVATE KEY-----\\n"
-            client_email = "tu-cuenta-de-servicio@correo.com"
-            ... (el contenido completo de tu JSON)
-            ```
-            """)
-        return None
-
+        return None, "No se encontraron las credenciales 'gcp_service_account' en los Secretos de Streamlit."
+    
     try:
-        scope = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
+        scope = [
+            'https://spreadsheets.google.com/feeds',
+            'https://www.googleapis.com/auth/drive'
+        ]
         creds_dict = dict(st.secrets["gcp_service_account"])
+        # Limpiar saltos de línea en la clave privada
         creds_dict["private_key"] = creds_dict["private_key"].replace("\\n", "\n")
+        
         creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
         client = gspread.authorize(creds)
-        return client
+        return client, None
     except Exception as e:
-        st.error(f"Error de autenticación con Google Cloud: {e}")
-        return None
+        return None, f"Error de autenticación con Google Cloud: {str(e)}"
 
-def inicializar_hoja_y_pestañas():
-    """Busca o crea la hoja de cálculo y asegura que tenga las pestañas correctas."""
-    conn = conectar_google_sheets()
-    if conn is None:
-        return None
+def inicializar_hoja_sheets():
+    client, error = obtener_cliente_sheets()
+    if error:
+        return None, error
+    
     try:
+        # Intentar abrir la hoja
+        spreadsheet = client.open("Base_Encuestas_SRPA")
+    except gspread.SpreadsheetNotFound:
         try:
-            sheet = conn.open("Base_Encuestas_SRPA")
-        except gspread.SpreadsheetNotFound:
-            sheet = conn.create("Base_Encuestas_SRPA")
-            # Compartir con el propietario real si es necesario (el correo de la cuenta lo tiene por defecto)
-        
-        # Pestaña 1: Cola_Revision
-        try:
-            sheet.worksheet("Cola_Revision")
-        except gspread.WorksheetNotFound:
-            worksheet = sheet.add_worksheet(title="Cola_Revision", rows="1000", cols="10")
-            headers = ['ID_Encuesta', 'Fecha_Carga', 'Tipo_Formulario', 'Municipio', 'Institucion_Educativa_IA', 'Rol', 'JSON_Respuestas', 'Estado']
-            worksheet.append_row(headers)
-            
-        # Pestaña 2: Respuestas_SRPA
-        try:
-            sheet.worksheet("Respuestas_SRPA")
-        except gspread.WorksheetNotFound:
-            worksheet = sheet.add_worksheet(title="Respuestas_SRPA", rows="5000", cols="30")
-            headers = [
-                'ID_Encuesta', 'Tipo_Formulario', 'Fecha', 'Municipio', 
-                'Institucion_Educativa_Verificada', 'Rol', 
-                'Conocimientos_P1', 'Conocimientos_P2', 'Conocimientos_P3', 'Conocimientos_P4', 
-                'Conocimientos_P5', 'Conocimientos_P6', 'Conocimientos_P7', 'Conocimientos_P8', 
-                'Sat_P1', 'Sat_P2', 'Sat_P3', 'Sat_P4', 'Sat_P5', 'Sat_P6', 'Sat_P7', 'Sat_P8', 'Sat_P9', 
-                'Verificado_Por', 'Fecha_Aprobacion'
-            ]
-            worksheet.append_row(headers)
-            
-        return sheet
-    except Exception as e:
-        st.error(f"Error inicializando Google Sheet: {e}")
-        return None
-
-# --- CARGAR COLA DE REVISIÓN (DEFENSIVA PARA EVITAR KEYERRORS) ---
-def cargar_cola_revision():
-    conn = conectar_google_sheets()
-    if conn is None:
-        return pd.DataFrame()
+            # Crear si no existe
+            spreadsheet = client.create("Base_Encuestas_SRPA")
+            # Compartir con el usuario que creó la cuenta de servicio si es necesario
+            # spreadsheet.share('tu_correo@gmail.com', perm_type='user', role='writer')
+        except Exception as e:
+            return None, f"No se encontró la hoja y no se pudo crear: {str(e)}"
+    
+    # Asegurar existencia de pestañas
     try:
-        sheet = conn.open("Base_Encuestas_SRPA")
-        worksheet = sheet.worksheet("Cola_Revision")
-        records = worksheet.get_all_records()
+        cola_sheet = spreadsheet.worksheet("Cola_Revision")
+    except gspread.WorksheetNotFound:
+        cola_sheet = spreadsheet.add_worksheet(title="Cola_Revision", rows="1000", cols="8")
+        cola_sheet.append_row([
+            "ID_Encuesta", "Fecha_Carga", "Tipo_Formulario", "Municipio", 
+            "Institucion_Educativa_IA", "Rol", "JSON_Respuestas", "Estado"
+        ])
         
-        columns_cola = ['ID_Encuesta', 'Fecha_Carga', 'Tipo_Formulario', 'Municipio', 'Institucion_Educativa_IA', 'Rol', 'JSON_Respuestas', 'Estado']
-        if not records:
-            df = pd.DataFrame(columns=columns_cola)
-        else:
-            df = pd.DataFrame(records)
-            for col in columns_cola:
-                if col not in df.columns:
-                    df[col] = "" # Inicializar columna faltante
-        return df
-    except Exception as e:
-        st.error(f"Error cargando Cola de Revisión: {e}")
-        return pd.DataFrame()
-
-# --- CARGAR RESPUESTAS VALIDADAS (DEFENSIVA PARA EVITAR KEYERRORS) ---
-def cargar_respuestas_validadas():
-    conn = conectar_google_sheets()
-    if conn is None:
-        return pd.DataFrame()
     try:
-        sheet = conn.open("Base_Encuestas_SRPA")
-        worksheet = sheet.worksheet("Respuestas_SRPA")
-        records = worksheet.get_all_records()
-        
-        columns_resp = [
-            'ID_Encuesta', 'Tipo_Formulario', 'Fecha', 'Municipio', 
-            'Institucion_Educativa_Verificada', 'Rol', 
-            'Conocimientos_P1', 'Conocimientos_P2', 'Conocimientos_P3', 'Conocimientos_P4', 
-            'Conocimientos_P5', 'Conocimientos_P6', 'Conocimientos_P7', 'Conocimientos_P8', 
-            'Sat_P1', 'Sat_P2', 'Sat_P3', 'Sat_P4', 'Sat_P5', 'Sat_P6', 'Sat_P7', 'Sat_P8', 'Sat_P9', 
-            'Verificado_Por', 'Fecha_Aprobacion'
+        respuestas_sheet = spreadsheet.worksheet("Respuestas_SRPA")
+    except gspread.WorksheetNotFound:
+        respuestas_sheet = spreadsheet.add_worksheet(title="Respuestas_SRPA", rows="5000", cols="24")
+        headers = [
+            "ID_Encuesta", "Tipo_Formulario", "Fecha", "Municipio", 
+            "Institucion_Educativa_Verificada", "Rol",
+            "Conocimientos_P1", "Conocimientos_P2", "Conocimientos_P3", "Conocimientos_P4",
+            "Conocimientos_P5", "Conocimientos_P6", "Conocimientos_P7", "Conocimientos_P8",
+            "Sat_P1", "Sat_P2", "Sat_P3", "Sat_P4", "Sat_P5", "Sat_P6", "Sat_P7", "Sat_P8", "Sat_P9",
+            "Verificado_Por", "Fecha_Aprobacion"
         ]
+        respuestas_sheet.append_row(headers)
+        
+    return spreadsheet, None
+
+# ==========================================================
+# GESTIÓN DE DATOS EN LA NUBE
+# ==========================================================
+def cargar_cola_revision(spreadsheet):
+    try:
+        sheet = spreadsheet.worksheet("Cola_Revision")
+        records = sheet.get_all_records()
         if not records:
-            df = pd.DataFrame(columns=columns_resp)
-        else:
-            df = pd.DataFrame(records)
-            for col in columns_resp:
-                if col not in df.columns:
-                    df[col] = ""
-        return df
+            return pd.DataFrame(columns=[
+                "ID_Encuesta", "Fecha_Carga", "Tipo_Formulario", "Municipio", 
+                "Institucion_Educativa_IA", "Rol", "JSON_Respuestas", "Estado"
+            ])
+        df = pd.DataFrame(records)
+        # Asegurar columnas críticas por seguridad
+        for col in ["ID_Encuesta", "Estado", "Institucion_Educativa_IA", "JSON_Respuestas"]:
+            if col not in df.columns:
+                df[col] = ""
+        return df[df["Estado"] == "Pendiente"]
     except Exception as e:
-        st.error(f"Error cargando Respuestas SRPA: {e}")
+        st.error(f"Error al cargar cola de revisión: {str(e)}")
         return pd.DataFrame()
 
-# --- LLAMADA COMPATIBLE CON GEMINI (MÚLTIPLES VERSIONES DEL SDK) ---
-def analizar_imagenes_con_gemini(api_key, img1_bytes, img2_bytes, prompt):
-    """Envía de forma robusta dos imágenes y un prompt a Gemini."""
-    if USE_NEW_SDK:
-        try:
+def cargar_respuestas_validadas(spreadsheet):
+    try:
+        sheet = spreadsheet.worksheet("Respuestas_SRPA")
+        records = sheet.get_all_records()
+        if not records:
+            return pd.DataFrame()
+        return pd.DataFrame(records)
+    except Exception as e:
+        st.error(f"Error al cargar respuestas validadas: {str(e)}")
+        return pd.DataFrame()
+
+# ==========================================================
+# INTEGRACIÓN CON GEMINI VISION API (OCR)
+# ==========================================================
+def procesar_encuesta_con_ia(pag1_bytes, pag2_bytes):
+    # Obtener clave de API
+    api_key = st.secrets.get("GEMINI_API_KEY", None)
+    if not api_key:
+        return None, "No se configuró la variable GEMINI_API_KEY en los secretos."
+    
+    if not GEMINI_LIB:
+        return None, "No se encuentran instaladas las librerías de Google Gemini en el servidor."
+
+    # Prompt estructurado de análisis
+    prompt = """
+    Eres un sistema de Inteligencia Artificial especializado en procesamiento de encuestas del "Proyecto Construyendo Futuro" (SRPA).
+    Analiza las dos imágenes proporcionadas (Página 1 y Página 2 de un mismo cuestionario físico) y extrae la información con alta precisión.
+
+    Instrucciones críticas:
+    1. Identifica el tipo de formulario: "PRETEST" o "POSTEST" buscando el título en la cabecera.
+    2. En la cabecera, extrae:
+       - Fecha (en formato YYYY-MM-DD o lo más cercano posible)
+       - Municipio
+       - Institución Educativa (presta atención a la escritura a mano alzada)
+       - Rol del participante: marca Estudiante, Docente, Padre de Familia o Líder comunitario.
+    3. Para las respuestas de conocimiento (Sección A):
+       - Identifica qué opción (a, b, c, d) tiene una "X" marcada. 
+       - Si una pregunta está vacía, no tiene ninguna X o está en blanco, devuélvela estrictamente como una cadena vacía "". No asumas ni inventes respuestas.
+    4. Para la Sección B de Satisfacción (solo si es POSTEST):
+       - Extrae la opción marcada (Excelente, Bueno, Regular, Deficiente) para cada una de las 9 filas.
+       - Si una fila está vacía, devuélvela como una cadena vacía "". No asumas respuestas.
+
+    Formato de salida requerido: JSON puro, sin markdown, que coincida con el siguiente esquema:
+    {
+      "tipo_formulario": "PRETEST" o "POSTEST",
+      "fecha": "2026-08-11",
+      "municipio": "Cartagena",
+      "institucion_educativa": "Nombre de la escuela escrito a mano",
+      "rol": "Estudiante",
+      "respuestas_conocimiento": {
+        "p1": "a", "p2": "b", "p3": "b", "p4": "a", 
+        "p5": "d", "p6": "a", "p7": "a", "p8": "ICBF"
+      },
+      "evaluacion_satisfaccion": {
+        "s1": "Excelente", "s2": "Bueno", "s3": "", "s4": "Excelente",
+        "s5": "Excelente", "s6": "Bueno", "s7": "Excelente", "s8": "Excelente", "s9": "Excelente"
+      }
+    }
+    """
+
+    try:
+        if GEMINI_LIB == "genai":
             client = genai.Client(api_key=api_key)
-            img1_part = types.Part.from_bytes(data=img1_bytes, mime_type="image/jpeg")
-            img2_part = types.Part.from_bytes(data=img2_bytes, mime_type="image/jpeg")
+            # Preparar partes de bytes
+            part1 = types.Part.from_bytes(data=pag1_bytes, mime_type="image/jpeg")
+            part2 = types.Part.from_bytes(data=pag2_bytes, mime_type="image/jpeg")
             
             response = client.models.generate_content(
-                model='gemini-1.5-flash',
-                contents=[img1_part, img2_part, prompt],
+                model='gemini-2.0-flash',
+                contents=[part1, part2, prompt],
                 config=types.GenerateContentConfig(
                     response_mime_type="application/json",
                     temperature=0.1
                 )
             )
-            return response.text
-        except Exception as e:
-            # Fallback en caso de error del SDK nuevo
-            pass
-            
-    # Configuración por SDK heredado
-    import google.generativeai as legacy_genai
-    legacy_genai.configure(api_key=api_key)
-    model = legacy_genai.GenerativeModel('gemini-1.5-flash')
-    
-    img1 = Image.open(io.BytesIO(img1_bytes))
-    img2 = Image.open(io.BytesIO(img2_bytes))
-    
-    response = model.generate_content(
-        [img1, img2, prompt],
-        generation_config=legacy_genai.types.GenerationConfig(
-            response_mime_type="application/json",
-            temperature=0.1
-        )
-    )
-    return response.text
-
-# --- PROGRAMA PRINCIPAL ---
-st.title("Proyecto \"Construyendo Futuro\"")
-st.caption("Sistematización Colaborativa con IA para Encuestas SRPA — Gobernación de Bolívar")
-
-# Asegurar la creación e inicialización de la base de datos en Sheets
-if GSPREAD_AVAILABLE and "gcp_service_account" in st.secrets:
-    inicializar_hoja_y_pestañas()
-
-tab_carga, tab_revision, tab_dashboard = st.tabs([
-    "📸 Carga de Encuestas", 
-    "✍️ Revisión de Caligrafía", 
-    "📊 Dashboard Estadístico"
-])
-
-# ================= TAB: CARGA DE ENCUESTAS =================
-with tab_carga:
-    st.header("Sistematizar Cuestionario")
-    st.write("Toma o sube las fotos de ambas páginas de la encuesta física para que la IA extraiga el contenido.")
-    
-    # Obtener clave API de los secretos
-    api_key_disponible = "GEMINI_API_KEY" in st.secrets
-    gemini_key = st.secrets.get("GEMINI_API_KEY", "") if api_key_disponible else ""
-
-    if not api_key_disponible:
-        gemini_key = st.text_input("Ingresa tu Gemini API Key (Capa gratuita en Google AI Studio):", type="password")
-        
-    col1, col2 = st.columns(2)
-    with col1:
-        img_pag1 = st.file_uploader("Subir foto: PÁGINA 1 (Cabecera e inicio)", type=["jpg", "jpeg", "png"], key="p1_loader")
-    with col2:
-        img_pag2 = st.file_uploader("Subir foto: PÁGINA 2 (Final de cuestionario)", type=["jpg", "jpeg", "png"], key="p2_loader")
-        
-    if img_pag1 and img_pag2:
-        if st.button("🚀 Procesar Encuesta con IA"):
-            if not gemini_key:
-                st.error("Por favor ingresa o configura tu Gemini API Key.")
-            else:
-                with st.spinner("Procesando imágenes con Gemini 1.5 Flash..."):
-                    try:
-                        # Leer bytes de imágenes
-                        bytes_p1 = img_pag1.read()
-                        bytes_p2 = img_pag2.read()
-                        
-                        # Llamar a Gemini
-                        json_result_text = analizar_imagenes_con_gemini(
-                            api_key=gemini_key,
-                            img1_bytes=bytes_p1,
-                            img2_bytes=bytes_p2,
-                            prompt=SYSTEM_PROMPT
-                        )
-                        
-                        # Limpiar JSON por si el modelo devuelve markdown ticks
-                        if "```json" in json_result_text:
-                            json_result_text = json_result_text.split("```json")[1].split("```")[0].strip()
-                        elif "```" in json_result_text:
-                            json_result_text = json_result_text.split("```")[1].split("```")[0].strip()
-                            
-                        data = json.loads(json_result_text)
-                        
-                        # Guardar en Google Sheets (Cola_Revision)
-                        conn = conectar_google_sheets()
-                        if conn:
-                            sheet = conn.open("Base_Encuestas_SRPA")
-                            worksheet = sheet.worksheet("Cola_Revision")
-                            
-                            id_enc = f"SRPA_{int(datetime.datetime.now().timestamp())}"
-                            fecha_carga = datetime.date.today().strftime("%Y-%m-%d")
-                            enc = data.get("encabezado", {})
-                            
-                            row = [
-                                id_enc,
-                                fecha_carga,
-                                data.get("tipo_formulario", "PRETEST"),
-                                enc.get("municipio", ""),
-                                enc.get("institucion_educativa_ia", ""),
-                                enc.get("rol", ""),
-                                json.dumps(data),
-                                "Pendiente"
-                            ]
-                            worksheet.append_row(row)
-                            st.success(f"¡Cuestionario procesado con éxito! Se guardó provisionalmente con el ID: **{id_enc}**. Pasa a la pestaña de Revisión para verificar la Institución.")
-                            st.rerun()
-                        else:
-                            st.error("No se pudo conectar con Google Sheets para almacenar los resultados.")
-                    except Exception as e:
-                        st.error(f"Error procesando la encuesta: {e}")
-
-# ================= TAB: REVISIÓN DE CALIGRAFÍA =================
-with tab_revision:
-    st.header("Banco de Verificación de Escritura a Mano")
-    st.write("Verifica y corrige el nombre de la Institución Educativa manuscrita antes de guardarla permanentemente.")
-    
-    df_cola = cargar_cola_revision()
-    
-    if df_cola.empty:
-        st.info("No hay encuestas pendientes de revisar en este momento.")
-    else:
-        df_pendiente = df_cola[df_cola['Estado'] == 'Pendiente']
-        
-        if df_pendiente.empty:
-            st.success("🎉 ¡Felicidades! Todas las encuestas pendientes han sido revisadas y validadas.")
+            text_result = response.text
         else:
-            st.warning(f"Tienes **{len(df_pendiente)}** encuestas pendientes por revisar.")
+            # google-generativeai clásico
+            google_genai.configure(api_key=api_key)
+            model = google_genai.GenerativeModel('gemini-1.5-flash')
             
-            # Selector de encuesta pendiente
-            opciones_pendientes = df_pendiente.apply(
-                lambda r: f"{r['ID_Encuesta']} - {r['Tipo_Formulario']} ({r['Municipio']} - {r['Fecha_Carga']})", axis=1
-            ).tolist()
+            img1 = Image.open(io.BytesIO(pag1_bytes))
+            img2 = Image.open(io.BytesIO(pag2_bytes))
             
-            seleccion = st.selectbox("Selecciona la encuesta para validar:", opciones_pendientes)
+            response = model.generate_content([img1, img2, prompt])
+            text_result = response.text
+        
+        # Limpieza por seguridad si la IA devuelve bloques markdown de código ```json
+        if "```json" in text_result:
+            text_result = text_result.split("```json")[1].split("```")[0].strip()
+        elif "```" in text_result:
+            text_result = text_result.split("```")[1].split("```")[0].strip()
             
-            if seleccion:
-                id_seleccionado = seleccion.split(" - ")[0]
-                registro = df_pendiente[df_pendiente['ID_Encuesta'] == id_seleccionado].iloc[0]
-                
-                # Cargar el JSON extraído por la IA
-                try:
-                    datos_ia = json.loads(registro['JSON_Respuestas'])
-                except Exception:
-                    datos_ia = {}
-                    
-                enc = datos_ia.get("encabezado", {})
-                
-                st.markdown("### Datos Extraídos preliminarmente")
-                
-                # Cuadro de edición para la caligrafía manuscrita de la escuela
-                escuela_ia = enc.get("institucion_educativa_ia", "")
-                
-                st.markdown("#### 📝 Corrección de Institución Educativa:")
-                institucion_corregida = st.text_input(
-                    "Nombre de la Institución Educativa (Corrígelo de ser necesario):", 
-                    value=escuela_ia
-                )
-                
-                # Mostrar el resto de metadatos
-                col1, col2, col3 = st.columns(3)
-                with col1:
-                    st.text_input("Municipio:", value=enc.get("municipio", ""), disabled=True)
-                with col2:
-                    st.text_input("Rol de Participante:", value=enc.get("rol", ""), disabled=True)
-                with col3:
-                    st.text_input("Tipo de Encuesta:", value=datos_ia.get("tipo_formulario", ""), disabled=True)
-                
-                col_btn1, col_btn2 = st.columns(2)
-                
-                # ACCIÓN 1: APROBAR E INGRESAR
-                with col_btn1:
-                    if st.button("✅ Aprobar e Ingresar a Base de Datos", use_container_width=True):
-                        conn = conectar_google_sheets()
-                        if conn:
-                            try:
-                                sheet = conn.open("Base_Encuestas_SRPA")
-                                
-                                # 1. Añadir fila consolidada a Respuestas_SRPA
-                                worksheet_respuestas = sheet.worksheet("Respuestas_SRPA")
-                                
-                                # Mapear respuestas de conocimiento
-                                resp_con = datos_ia.get("conocimientos", {})
-                                p1 = resp_con.get("p1", "")
-                                p2 = resp_con.get("p2", "")
-                                p3 = resp_con.get("p3", "")
-                                p4 = resp_con.get("p4", "")
-                                p5 = resp_con.get("p5", "")
-                                p6 = resp_con.get("p6", "")
-                                p7 = resp_con.get("p7", "")
-                                p8 = resp_con.get("p8", "") if datos_ia.get("tipo_formulario") == "PRETEST" else ""
-                                
-                                # Mapear respuestas de satisfacción
-                                resp_sat = datos_ia.get("satisfaccion", {}) or {}
-                                s1 = resp_sat.get("sat_1", "")
-                                s2 = resp_sat.get("sat_2", "")
-                                s3 = resp_sat.get("sat_3", "")
-                                s4 = resp_sat.get("sat_4", "")
-                                s5 = resp_sat.get("sat_5", "")
-                                s6 = resp_sat.get("sat_6", "")
-                                s7 = resp_sat.get("sat_7", "")
-                                s8 = resp_sat.get("sat_8", "")
-                                s9 = resp_sat.get("sat_9", "")
-                                
-                                # Armar fila final
-                                row_final = [
-                                    id_seleccionado,
-                                    datos_ia.get("tipo_formulario", "PRETEST"),
-                                    enc.get("fecha", ""),
-                                    enc.get("municipio", ""),
-                                    institucion_corregida, # Escuela corregida por el usuario
-                                    enc.get("rol", ""),
-                                    p1, p2, p3, p4, p5, p6, p7, p8,
-                                    s1, s2, s3, s4, s5, s6, s7, s8, s9,
-                                    "Facilitador Campo",
-                                    datetime.date.today().strftime("%Y-%m-%d")
-                                ]
-                                worksheet_respuestas.append_row(row_final)
-                                
-                                # 2. Cambiar estado en Cola_Revision a Aprobado
-                                worksheet_cola = sheet.worksheet("Cola_Revision")
-                                cell = worksheet_cola.find(id_seleccionado)
-                                if cell:
-                                    # La columna Estado es la columna 8
-                                    worksheet_cola.update_cell(cell.row, 8, "Aprobado")
-                                    
-                                st.success("¡Registro consolidado de forma definitiva!")
-                                st.rerun()
-                            except Exception as e:
-                                st.error(f"Error consolidando el registro: {e}")
-                
-                # ACCIÓN 2: RECHAZAR ENTRADA
-                with col_btn2:
-                    if st.button("❌ Rechazar Entrada (Eliminar de la Cola)", use_container_width=True):
-                        conn = conectar_google_sheets()
-                        if conn:
-                            try:
-                                sheet = conn.open("Base_Encuestas_SRPA")
-                                worksheet_cola = sheet.worksheet("Cola_Revision")
-                                cell = worksheet_cola.find(id_seleccionado)
-                                if cell:
-                                    # La columna Estado es la columna 8. Lo marcamos como "Rechazado" para no borrar
-                                    # físicamente el log, o podemos eliminar la fila si se desea. Marcamos "Rechazado"
-                                    worksheet_cola.update_cell(cell.row, 8, "Rechazado")
-                                st.warning("Registro descartado y eliminado de la cola de pendientes.")
-                                st.rerun()
-                            except Exception as e:
-                                st.error(f"Error rechazando el registro: {e}")
+        return json.loads(text_result), None
+    except Exception as e:
+        return None, f"Error de comunicación con la API de Gemini: {str(e)}"
 
-# ================= TAB: DASHBOARD ESTADÍSTICO =================
-with tab_dashboard:
-    st.header("Resultados de Impacto y Satisfacción en Tiempo Real")
-    st.write("Estadísticas consolidadas directamente de las encuestas validadas.")
+# ==========================================================
+# APLICACIÓN PRINCIPAL - CONTROLADOR
+# ==========================================================
+def main():
+    st.title("Proyecto Construyendo Futuro 📱")
+    st.subheader("Evaluación de Conocimientos y Satisfacción - SRPA")
     
-    df_validadas = cargar_respuestas_validadas()
+    # Intentar inicializar Google Sheets
+    spreadsheet = None
+    sheet_error = None
     
-    if df_validadas.empty:
-        st.info("No hay datos consolidados en la base de datos de Google Sheets para generar estadísticas aún. Empieza a validar encuestas para ver los gráficos interactivos.")
+    if G_SHEETS_AVAILABLE:
+        spreadsheet, sheet_error = inicializar_hoja_sheets()
     else:
-        # ---- FILTROS DEL DASHBOARD ----
-        st.markdown("### 🔍 Filtrar Visualizaciones")
-        col_f1, col_f2 = st.columns(2)
-        with col_f1:
-            municipios_disponibles = ["Todos"] + df_validadas["Municipio"].dropna().unique().tolist()
-            filtro_muni = st.selectbox("Municipio:", municipios_disponibles)
-        with col_f2:
-            roles_disponibles = ["Todos"] + df_validadas["Rol"].dropna().unique().tolist()
-            filtro_rol = st.selectbox("Rol del Participante:", roles_disponibles)
-            
-        # Filtrar DataFrame
-        df_filtrado = df_validadas.copy()
-        if filtro_muni != "Todos":
-            df_filtrado = df_filtrado[df_filtrado["Municipio"] == filtro_muni]
-        if filtro_rol != "Todos":
-            df_filtrado = df_filtrado[df_filtrado["Rol"] == filtro_rol]
-            
-        # ---- MÓDULO DE KPIs ----
-        col_kpi1, col_kpi2, col_kpi3, col_kpi4 = st.columns(4)
-        
-        with col_kpi1:
-            st.markdown(f"""
-            <div class="kpi-card">
-                <span style="font-size: 28px; font-weight: bold; color: #1e3a8a;">{len(df_filtrado)}</span><br>
-                <span style="font-size: 14px; color: #475569; font-weight: 500;">Total Consolidadas</span>
-            </div>
-            """, unsafe_allowed_value=True)
-            
-        with col_kpi2:
-            df_cola_activa = cargar_cola_revision()
-            total_cola = len(df_cola_activa[df_cola_activa["Estado"] == "Pendiente"]) if not df_cola_activa.empty else 0
-            st.markdown(f"""
-            <div class="kpi-card">
-                <span style="font-size: 28px; font-weight: bold; color: #b45309;">{total_cola}</span><br>
-                <span style="font-size: 14px; color: #475569; font-weight: 500;">En Cola de Revisión</span>
-            </div>
-            """, unsafe_allowed_value=True)
-            
-        with col_kpi3:
-            total_pre = len(df_filtrado[df_filtrado["Tipo_Formulario"] == "PRETEST"])
-            st.markdown(f"""
-            <div class="kpi-card">
-                <span style="font-size: 28px; font-weight: bold; color: #047857;">{total_pre}</span><br>
-                <span style="font-size: 14px; color: #475569; font-weight: 500;">Pretests Registrados</span>
-            </div>
-            """, unsafe_allowed_value=True)
-            
-        with col_kpi4:
-            total_post = len(df_filtrado[df_filtrado["Tipo_Formulario"] == "POSTEST"])
-            st.markdown(f"""
-            <div class="kpi-card">
-                <span style="font-size: 28px; font-weight: bold; color: #0284c7;">{total_post}</span><br>
-                <span style="font-size: 14px; color: #475569; font-weight: 500;">Postests Registrados</span>
-            </div>
-            """, unsafe_allowed_value=True)
-            
-        st.markdown("---")
-        
-        # Gráficos si hay datos filtrados
-        if df_filtrado.empty:
-            st.warning("No hay registros que coincidan con los filtros seleccionados.")
-        else:
-            col_chart1, col_chart2 = st.columns(2)
-            
-            # 1. PARTICIPACIÓN POR ROL
-            with col_chart1:
-                st.subheader("👥 Distribución de Participantes")
-                conteo_roles = df_filtrado["Rol"].value_counts().reset_index()
-                conteo_roles.columns = ["Rol", "Cantidad"]
-                fig_roles = px.pie(
-                    conteo_roles, 
-                    values="Cantidad", 
-                    names="Rol", 
-                    hole=0.4,
-                    color_discrete_sequence=px.colors.qualitative.Safe
-                )
-                fig_roles.update_layout(margin=dict(l=20, r=20, t=20, b=20))
-                st.plotly_chart(fig_roles, use_container_width=True)
-                
-            # 2. MEDICIÓN ANTES Y DESPUÉS (RESPUESTAS CORRECTAS CLAVE)
-            with col_chart2:
-                st.subheader("📚 Comparativa de Conocimiento (Antes vs Después)")
-                
-                # Filtrar Pretest y Postest para comparar
-                df_pre = df_filtrado[df_filtrado["Tipo_Formulario"] == "PRETEST"]
-                df_post = df_filtrado[df_filtrado["Tipo_Formulario"] == "POSTEST"]
-                
-                # Definimos conceptos clave y mapeamos respuestas correctas
-                # P2 Pretest == P1 Postest (Finalidad del SRPA) -> Correcta: 'b'
-                # P3 Pretest == P2 Postest (Factor de Riesgo) -> Correcta: 'b'
-                # P4 Pretest == P3 Postest (Factor Protector) -> Correcta: 'a' en Pre, 'b' en Post (según cuestionarios oficiales)
-                # P5 Pretest == P4 Postest (Responsabilidad de Prevención) -> Correcta: 'd'
-                
-                conceptos = ["Finalidad SRPA", "Factor Riesgo", "Factor Protector", "Responsabilidad"]
-                correctas_pre = [0, 0, 0, 0]
-                correctas_post = [0, 0, 0, 0]
-                
-                # Calcular porcentajes si hay registros
-                if len(df_pre) > 0:
-                    correctas_pre[0] = (df_pre["Conocimientos_P2"] == "b").mean() * 100
-                    correctas_pre[1] = (df_pre["Conocimientos_P3"] == "b").mean() * 100
-                    correctas_pre[2] = (df_pre["Conocimientos_P4"] == "a").mean() * 100
-                    correctas_pre[3] = (df_pre["Conocimientos_P5"] == "d").mean() * 100
-                    
-                if len(df_post) > 0:
-                    correctas_post[0] = (df_post["Conocimientos_P1"] == "b").mean() * 100
-                    correctas_post[1] = (df_post["Conocimientos_P2"] == "b").mean() * 100
-                    correctas_post[2] = (df_post["Conocimientos_P3"] == "b").mean() * 100
-                    correctas_post[3] = (df_post["Conocimientos_P4"] == "d").mean() * 100
-                
-                fig_comp = go.Figure(data=[
-                    go.Bar(name='Antes (Pretest)', x=conceptos, y=correctas_pre, marker_color='#ef4444'),
-                    go.Bar(name='Después (Postest)', x=conceptos, y=correctas_post, marker_color='#22c55e')
-                ])
-                fig_comp.update_layout(
-                    barmode='group',
-                    yaxis_title='Respuestas Correctas (%)',
-                    yaxis_range=[0, 100],
-                    margin=dict(l=20, r=20, t=20, b=20)
-                )
-                st.plotly_chart(fig_comp, use_container_width=True)
+        sheet_error = "Las librerías de Google Sheets (gspread, oauth2client) no están disponibles."
 
-            # 3. EVALUACIÓN DE SATISFACCIÓN (SÓLO POSTEST)
-            df_post_satisfaccion = df_filtrado[df_filtrado["Tipo_Formulario"] == "POSTEST"]
-            if not df_post_satisfaccion.empty:
-                st.subheader("⭐ Satisfacción de las Jornadas de Prevención")
-                
-                sat_cols = [f"Sat_P{i}" for i in range(1, 10)]
-                aspectos = [
-                    "1. Claridad de la información",
-                    "2. Dominio de facilitadores",
-                    "3. Metodología utilizada",
-                    "4. Participación e integración",
-                    "5. Utilidad de los temas",
-                    "6. Organización de la jornada",
-                    "7. Materiales y recursos",
-                    "8. Fortaleció conocimientos",
-                    "9. Recomendaría la jornada"
-                ]
-                
-                # Mapear opiniones de satisfacción a puntajes numéricos
-                # Excelente = 4, Bueno = 3, Regular = 2, Deficiente = 1
-                map_sat = {"Excelente": 4, "Bueno": 3, "Regular": 2, "Deficiente": 1, "": None}
-                
-                puntajes_aspectos = []
-                for col in sat_cols:
-                    if col in df_post_satisfaccion.columns:
-                        puntos = df_post_satisfaccion[col].map(map_sat).dropna()
-                        promedio = puntos.mean() if not puntos.empty else 0
-                        puntajes_aspectos.append(promedio)
+    # Mostrar error si no se pudo conectar con Sheets de manera clara
+    if sheet_error:
+        st.markdown(f"""
+        <div class="error-box">
+            <h4>⚠️ Error de Conexión a Base de Datos en la Nube</h4>
+            <p>{sheet_error}</p>
+            <p><strong>¿Cómo solucionarlo?</strong> Asegúrate de que las credenciales de tu cuenta de servicio de Google Cloud estén correctamente configuradas en el apartado <strong>Secrets</strong> de Streamlit Cloud como <code>[gcp_service_account]</code>.</p>
+        </div>
+        """, unsafe_allow_html=True)
+        st.stop()
+
+    # Creación del menú de pestañas interactivo
+    tab_upload, tab_review, tab_dashboard = st.tabs([
+        "📸 Capturar / Cargar Encuesta", 
+        "✏️ Banco de Verificación de Caligrafía", 
+        "📊 Dashboard Estadístico"
+    ])
+
+    # ------------------------------------------------------
+    # PESTAÑA 1: CARGAR ENCUESTA (MÓVIL)
+    # ------------------------------------------------------
+    with tab_upload:
+        st.markdown("### Digitalización de Encuesta por Foto")
+        st.write("Sube la **Página 1** y la **Página 2** del mismo cuestionario para que el sistema las analice de forma conjunta.")
+        
+        col1, col2 = st.columns(2)
+        with col1:
+            file_pag1 = st.file_uploader("Subir foto de la Página 1 (Cabecera y Preguntas 1-3)", type=["jpg", "png", "jpeg"])
+        with col2:
+            file_pag2 = st.file_uploader("Subir foto de la Página 2 (Preguntas de Conocimiento y Satisfacción)", type=["jpg", "png", "jpeg"])
+            
+        if file_pag1 and file_pag2:
+            st.markdown("""
+            <div class="success-box">
+                ✔️ Las imágenes se cargaron correctamente. ¡Estás listo para enviarlas a procesar con Inteligencia Artificial!
+            </div>
+            """, unsafe_allow_html=True)
+            
+            if st.button("🔍 Iniciar Análisis con IA"):
+                with st.spinner("La Inteligencia Artificial está procesando ambas páginas simultáneamente..."):
+                    # Leer bytes de imágenes
+                    pag1_bytes = file_pag1.read()
+                    pag2_bytes = file_pag2.read()
+                    
+                    resultado, error = procesar_encuesta_con_ia(pag1_bytes, pag2_bytes)
+                    
+                    if error:
+                        st.error(error)
                     else:
-                        puntajes_aspectos.append(0)
+                        # Guardar temporalmente en la cola de revisión
+                        try:
+                            cola_sheet = spreadsheet.worksheet("Cola_Revision")
+                            id_encuesta = f"EN_SRPA_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+                            
+                            # Preparar datos temporales
+                            tipo_f = resultado.get("tipo_formulario", "PRETEST")
+                            municipio = resultado.get("municipio", "")
+                            ie_ia = resultado.get("institucion_educativa", "")
+                            rol = resultado.get("rol", "Estudiante")
+                            
+                            # Respuestas empaquetadas en JSON
+                            json_respuestas = json.dumps({
+                                "respuestas_conocimiento": resultado.get("respuestas_conocimiento", {}),
+                                "evaluacion_satisfaccion": resultado.get("evaluacion_satisfaccion", {})
+                            })
+                            
+                            cola_sheet.append_row([
+                                id_encuesta,
+                                datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                                tipo_f,
+                                municipio,
+                                ie_ia,
+                                rol,
+                                json_respuestas,
+                                "Pendiente"
+                            ])
+                            
+                            st.balloons()
+                            st.success(f"¡Análisis exitoso! Encuesta '{id_encuesta}' enviada a revisión de caligrafía.")
+                            # Forzar recarga rápida
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"Error al escribir en la cola de revisión en Google Sheets: {str(e)}")
+
+    # ------------------------------------------------------
+    # PESTAÑA 2: BANCO DE VERIFICACIÓN (HUMAN-IN-THE-LOOP)
+    # ------------------------------------------------------
+    with tab_review:
+        st.markdown("### Banco de Verificación de Escritura a Mano")
+        st.write("Verifica y corrige el nombre de la Institución Educativa manuscrita antes de guardarla permanentemente.")
+        
+        df_cola = cargar_cola_revision(spreadsheet)
+        
+        if df_cola.empty:
+            st.info("🎉 ¡Excelente trabajo! No hay encuestas pendientes de verificación de caligrafía en este momento.")
+        else:
+            st.warning(f"Hay {len(df_cola)} encuestas en cola pendientes de revisión.")
+            
+            # Tomar la primera encuesta en cola
+            fila_actual = df_cola.iloc[0]
+            id_encuesta = fila_actual["ID_Encuesta"]
+            ie_ia = fila_actual["Institucion_Educativa_IA"]
+            tipo_f = fila_actual["Tipo_Formulario"]
+            municipio = fila_actual["Municipio"]
+            rol = fila_actual["Rol"]
+            
+            # Decodificar respuestas
+            try:
+                resp_data = json.loads(fila_actual["JSON_Respuestas"])
+                conocimientos = resp_data.get("respuestas_conocimiento", {})
+                satisfaccion = resp_data.get("evaluacion_satisfaccion", {})
+            except Exception:
+                conocimientos = {}
+                satisfaccion = {}
                 
-                fig_sat = px.bar(
-                    x=puntajes_aspectos,
-                    y=aspectos,
-                    orientation='h',
-                    labels={'x': 'Puntuación Promedio (Máx 4.0)', 'y': 'Aspecto Evaluado'},
-                    color=puntajes_aspectos,
-                    color_continuous_scale='Greens',
-                    range_x=[1.0, 4.0]
-                )
-                fig_sat.update_layout(coloraxis_showscale=False, margin=dict(l=20, r=20, t=20, b=20))
+            st.markdown(f"**Revisando Registro:** `{id_encuesta}` | **Tipo:** `{tipo_f}`")
+            
+            # Formulario interactivo de corrección
+            col_rev1, col_rev2 = st.columns(2)
+            with col_rev1:
+                st.markdown("<div class='card'>", unsafe_allow_html=True)
+                st.markdown("#### ✏️ Validación de Cabecera")
+                ie_verificada = st.text_input("Institución Educativa (Corrige la caligrafía si es necesario):", value=ie_ia)
+                municipio_verificado = st.text_input("Municipio:", value=municipio)
+                rol_verificado = st.selectbox("Rol del Participante:", ["Estudiante", "Docente", "Padre de Familia", "Lider comunitario"], index=["Estudiante", "Docente", "Padre de Familia", "Lider comunitario"].index(rol) if rol in ["Estudiante", "Docente", "Padre de Familia", "Lider comunitario"] else 0)
+                st.markdown("</div>", unsafe_allow_html=True)
+                
+            with col_rev2:
+                st.markdown("<div class='card'>", unsafe_allow_html=True)
+                st.markdown("#### 📋 Respuestas Extraídas")
+                st.write("**Respuestas de Conocimiento:**")
+                st.write(conocimientos)
+                if tipo_f == "POSTEST":
+                    st.write("**Evaluación de Satisfacción:**")
+                    st.write(satisfaccion)
+                st.markdown("</div>", unsafe_allow_html=True)
+                
+            # Botones de Acción
+            col_btn1, col_btn2 = st.columns(2)
+            with col_btn1:
+                if st.button("✅ Aprobar e Ingresar a Base de Datos", type="primary"):
+                    with st.spinner("Guardando en la base de datos oficial..."):
+                        try:
+                            respuestas_sheet = spreadsheet.worksheet("Respuestas_SRPA")
+                            
+                            # Formatear fila para Base de Datos
+                            fila_final = [
+                                id_encuesta,
+                                tipo_f,
+                                datetime.now().strftime("%Y-%m-%d"),
+                                municipio_verificado,
+                                ie_verificada,
+                                rol_verificado,
+                                conocimientos.get("p1", ""), conocimientos.get("p2", ""),
+                                conocimientos.get("p3", ""), conocimientos.get("p4", ""),
+                                conocimientos.get("p5", ""), conocimientos.get("p6", ""),
+                                conocimientos.get("p7", ""), conocimientos.get("p8", ""),
+                                satisfaccion.get("s1", ""), satisfaccion.get("s2", ""),
+                                satisfaccion.get("s3", ""), satisfaccion.get("s4", ""),
+                                satisfaccion.get("s5", ""), satisfaccion.get("s6", ""),
+                                satisfaccion.get("s7", ""), satisfaccion.get("s8", ""),
+                                satisfaccion.get("s9", ""),
+                                "Revisor_Movil",
+                                datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                            ]
+                            
+                            # Escribir en base final
+                            respuestas_sheet.append_row(fila_final)
+                            
+                            # Actualizar estado en la cola de revisión de gsheets
+                            cola_sheet = spreadsheet.worksheet("Cola_Revision")
+                            celda = cola_sheet.find(id_encuesta)
+                            # Actualizar columna "Estado" (columna 8)
+                            cola_sheet.update_cell(celda.row, 8, "Aprobado")
+                            
+                            st.success("¡Registro consolidado y aprobado con éxito!")
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"Error al consolidar la información: {str(e)}")
+                            
+            with col_btn2:
+                if st.button("❌ Rechazar Entrada (Eliminar de la Cola)"):
+                    with st.spinner("Eliminando entrada defectuosa..."):
+                        try:
+                            cola_sheet = spreadsheet.worksheet("Cola_Revision")
+                            celda = cola_sheet.find(id_encuesta)
+                            cola_sheet.update_cell(celda.row, 8, "Rechazado")
+                            st.success("Registro rechazado y eliminado de la cola.")
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"Error al rechazar el registro: {str(e)}")
+
+    # ------------------------------------------------------
+    # PESTAÑA 3: DASHBOARD ESTADÍSTICO EN TIEMPO REAL
+    # ------------------------------------------------------
+    with tab_dashboard:
+        st.markdown("### Dashboard Estadístico del Proyecto")
+        
+        df_final = cargar_respuestas_validadas(spreadsheet)
+        
+        if df_final.empty:
+            st.markdown("""
+            <div class="warning-box">
+                <h4>📊 No hay información registrada</h4>
+                <p>La base de datos se encuentra vacía actualmente. Comienza a subir fotos en el apartado <strong>Capturar / Cargar Encuesta</strong> para ver gráficos automatizados en tiempo real aquí.</p>
+            </div>
+            """, unsafe_allow_html=True)
+        else:
+            # Mostrar métricas clave de Cobertura
+            total_registros = len(df_final)
+            pretests = len(df_final[df_final["Tipo_Formulario"] == "PRETEST"])
+            postests = len(df_final[df_final["Tipo_Formulario"] == "POSTEST"])
+            
+            st.markdown("#### 📈 Resumen General de Cobertura")
+            col_m1, col_m2, col_m3 = st.columns(3)
+            with col_m1:
+                st.metric("Total de Participantes", f"{total_registros}")
+            with col_m2:
+                st.metric("Pretests Realizados", f"{pretests}")
+            with col_m3:
+                st.metric("Postests Realizados", f"{postests}")
+                
+            # Filtro dinámico por Municipio
+            municipios_disponibles = list(df_final["Municipio"].unique())
+            municipio_sel = st.selectbox("Filtrar por Municipio:", ["Todos"] + municipios_disponibles)
+            
+            df_filtrado = df_final if municipio_sel == "Todos" else df_final[df_final["Municipio"] == municipio_sel]
+            
+            # Gráficos Dinámicos
+            col_g1, col_g2 = st.columns(2)
+            with col_g1:
+                st.markdown("<div class='card'>", unsafe_allow_html=True)
+                st.write("**Participantes por Rol**")
+                rol_counts = df_filtrado["Rol"].value_counts().reset_index()
+                rol_counts.columns = ["Rol", "Cantidad"]
+                fig_rol = px.pie(rol_counts, names="Rol", values="Cantidad", hole=0.4, color_discrete_sequence=px.colors.qualitative.Pastel)
+                st.plotly_chart(fig_rol, use_container_width=True)
+                st.markdown("</div>", unsafe_allow_html=True)
+                
+            with col_g2:
+                st.markdown("<div class='card'>", unsafe_allow_html=True)
+                st.write("**Participación por Institución Educativa**")
+                ie_counts = df_filtrado["Institucion_Educativa_Verificada"].value_counts().reset_index()
+                ie_counts.columns = ["IE", "Cantidad"]
+                fig_ie = px.bar(ie_counts, x="Cantidad", y="IE", orientation="h", color_discrete_sequence=["#2563eb"])
+                st.plotly_chart(fig_ie, use_container_width=True)
+                st.markdown("</div>", unsafe_allow_html=True)
+
+            # Cálculo de progreso e Impacto Educativo (Preguntas compartidas)
+            # P1 en Pretest / Postest (en el pretest es p2, en el postest es p1 - Finalidad del SRPA)
+            st.markdown("<div class='card'>", unsafe_allow_html=True)
+            st.write("#### 🎯 Comparativa de Respuestas Correctas (Pretest vs. Postest)")
+            st.write("Análisis de asimilación del conocimiento en las jornadas del Proyecto.")
+            
+            # Filtrar pretest y postest del dataset filtrado
+            df_pre = df_filtrado[df_filtrado["Tipo_Formulario"] == "PRETEST"]
+            df_pos = df_filtrado[df_filtrado["Tipo_Formulario"] == "POSTEST"]
+            
+            if not df_pre.empty and not df_pos.empty:
+                # Calcular aciertos en Finalidad del SRPA (opción 'b' es correcta)
+                aciertos_p1_pre = (df_pre["Conocimientos_P2"] == "b").mean() * 100
+                aciertos_p1_pos = (df_pos["Conocimientos_P1"] == "b").mean() * 100
+                
+                # Calcular aciertos en Factores de Riesgo (opción 'b' es correcta)
+                aciertos_p2_pre = (df_pre["Conocimientos_P3"] == "b").mean() * 100
+                aciertos_p2_pos = (df_pos["Conocimientos_P2"] == "b").mean() * 100
+                
+                # Gráfico comparativo
+                fig_comp = go.Figure(data=[
+                    go.Bar(name='PRETEST (Antes)', x=['Finalidad del SRPA', 'Factores de Riesgo'], y=[aciertos_p1_pre, aciertos_p2_pre], marker_color='#93c5fd'),
+                    go.Bar(name='POSTEST (Después)', x=['Finalidad del SRPA', 'Factores de Riesgo'], y=[aciertos_p1_pos, aciertos_p2_pos], marker_color='#2563eb')
+                ])
+                fig_comp.update_layout(barmode='group', yaxis_title='Porcentaje de Aciertos (%)', yaxis_range=[0, 100])
+                st.plotly_chart(fig_comp, use_container_width=True)
+            else:
+                st.info("Se requiere contar con al menos un registro de Pretest y un registro de Postest aprobados para visualizar la gráfica comparativa de impacto.")
+            st.markdown("</div>", unsafe_allow_html=True)
+
+if __name__ == "__main__":
+    main()
+
                 st.plotly_chart(fig_sat, use_container_width=True)
             else:
                 st.info("ℹ️ Para ver las métricas de satisfacción y el desglose de calidad de las jornadas, aprueba al menos una encuesta de tipo **POSTEST**.")
