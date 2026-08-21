@@ -404,7 +404,7 @@ with tab1:
                     
                     # Call Gemini API with Fallback Models
                     api_key = st.secrets["GEMINI_API_KEY"]
-                    models_to_try = ["gemini-2.5-flash", "gemini-1.5-flash", "gemini-2.5-pro"]
+                    models_to_try = ["gemini-3.6-flash", "gemini-2.5-flash", "gemini-2.5-pro"]
                     
                     response_text = ""
                     success_model = None
