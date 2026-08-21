@@ -56,6 +56,83 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
+
+# -----------------------------------------------------------------------------
+# NORMALIZACIÓN DE DATOS DE GOOGLE SHEETS
+# -----------------------------------------------------------------------------
+def normalizar_texto(valor):
+    """Limpia espacios normales e invisibles sin alterar el contenido útil."""
+    if valor is None:
+        return ""
+    texto = str(valor)
+    # Caracteres invisibles que pueden romper comparaciones exactas
+    for caracter in ("\ufeff", "\u200b", "\u200c", "\u200d", "\u2060", "\xa0"):
+        texto = texto.replace(caracter, " ")
+    return " ".join(texto.strip().split())
+
+
+def normalizar_encabezado(valor):
+    """Normaliza encabezados para evitar desalineaciones por espacios/carácteres invisibles."""
+    return normalizar_texto(valor).casefold()
+
+
+def construir_dataframe_hoja(all_rows, expected_cols):
+    """
+    Convierte la hoja en DataFrame usando encabezados canónicos.
+    Corrige:
+      - espacios/carácteres invisibles en encabezados,
+      - filas con menos/más columnas,
+      - celdas con espacios extra.
+    """
+    if not all_rows:
+        return pd.DataFrame(columns=expected_cols)
+
+    headers_raw = list(all_rows[0])
+    headers = [normalizar_texto(h) for h in headers_raw]
+
+    # Solo recortar columnas vacías al final; no tocar columnas intermedias.
+    while headers and headers[-1] == "":
+        headers.pop()
+
+    if not headers:
+        return pd.DataFrame(columns=expected_cols)
+
+    aliases = {normalizar_encabezado(col): col for col in expected_cols}
+
+    # Convertir cualquier variante del encabezado a su nombre oficial.
+    headers_canonicos = []
+    usados = set()
+    for header in headers:
+        clave = normalizar_encabezado(header)
+        canonico = aliases.get(clave, header)
+        # Evitar duplicados de encabezados; conserva el primero.
+        if canonico in usados and canonico in expected_cols:
+            canonico = f"{canonico}__duplicado_{len(headers_canonicos)}"
+        headers_canonicos.append(canonico)
+        usados.add(canonico)
+
+    registros = []
+    for row in all_rows[1:]:
+        row_values = [normalizar_texto(v) for v in list(row)]
+        if len(row_values) < len(headers_canonicos):
+            row_values.extend([""] * (len(headers_canonicos) - len(row_values)))
+        elif len(row_values) > len(headers_canonicos):
+            row_values = row_values[:len(headers_canonicos)]
+
+        # Ignorar filas totalmente vacías.
+        if not any(row_values):
+            continue
+
+        registros.append(dict(zip(headers_canonicos, row_values)))
+
+    df = pd.DataFrame(registros)
+
+    for col in expected_cols:
+        if col not in df.columns:
+            df[col] = ""
+
+    return df[expected_cols]
+
 # -----------------------------------------------------------------------------
 # CONEXIÓN INTEGRADA A GOOGLE SHEETS (Con Robustez Extrema)
 # -----------------------------------------------------------------------------
@@ -84,88 +161,66 @@ def conectar_google_sheets():
     return None
 
 def obtener_hoja_calculo():
-    """Busca o crea automáticamente la hoja de cálculo oficial en Google Drive."""
+    """Obtiene siempre el objeto Spreadsheet actual, sin cachear datos de hojas."""
     gc = conectar_google_sheets()
     if gc is None:
         return None
-        
+
     nombre_db = "Base_Encuestas_SRPA"
     try:
         return gc.open(nombre_db)
     except gspread.exceptions.SpreadsheetNotFound:
-        # Si no existe, la creamos desde cero con la estructura oficial limpia
+        # Si no existe, la creamos desde cero con la estructura oficial limpia.
         sh = gc.create(nombre_db)
-        
+
         # Pestaña 1: Cola_Revision
         ws_cola = sh.get_worksheet(0)
         ws_cola.update_title("Cola_Revision")
         headers_cola = [
-            "ID_Encuesta", "Fecha_Carga", "Tipo_Formulario", "Municipio", 
-            "Institucion_Educativa_IA", "Rol", "JSON_Respuestas", "Estado", 
+            "ID_Encuesta", "Fecha_Carga", "Tipo_Formulario", "Municipio",
+            "Institucion_Educativa_IA", "Rol", "JSON_Respuestas", "Estado",
             "Foto_P1_Base64", "Foto_P2_Base64", "Verificado_Por"
         ]
-        ws_cola.append_row(headers_cola)
-        
+        ws_cola.append_row(headers_cola, value_input_option="RAW", insert_data_option="INSERT_ROWS")
+
         # Pestaña 2: Respuestas_SRPA
         headers_respuestas = [
-            "ID_Encuesta", "Tipo_Formulario", "Fecha", "Municipio", 
-            "Institucion_Educativa_Verificada", "Rol", 
+            "ID_Encuesta", "Tipo_Formulario", "Fecha", "Municipio",
+            "Institucion_Educativa_Verificada", "Rol",
             "Conocimientos_P1", "Conocimientos_P2", "Conocimientos_P3", "Conocimientos_P4",
             "Conocimientos_P5", "Conocimientos_P6", "Conocimientos_P7", "Conocimientos_P8",
             "Sat_P1", "Sat_P2", "Sat_P3", "Sat_P4", "Sat_P5", "Sat_P6", "Sat_P7", "Sat_P8", "Sat_P9",
             "Verificado_Por", "Fecha_Aprobacion"
         ]
         ws_respuestas = sh.add_worksheet(title="Respuestas_SRPA", rows="1000", cols="30")
-        ws_respuestas.append_row(headers_respuestas)
-        
+        ws_respuestas.append_row(headers_respuestas, value_input_option="RAW", insert_data_option="INSERT_ROWS")
+
         return sh
 
 # -----------------------------------------------------------------------------
 # CARGA DE DATOS ROBUSTA (Evitando GSpreadException y KeyError de forma absoluta)
 # -----------------------------------------------------------------------------
 def cargar_cola_revision():
-    """Carga y procesa la cola de revisión de forma 100% inmune a desalineaciones y KeyErrors."""
+    """Carga la cola y normaliza encabezados/celdas para evitar falsos vacíos."""
     sh = obtener_hoja_calculo()
     expected_cols = [
-        "ID_Encuesta", "Fecha_Carga", "Tipo_Formulario", "Municipio", 
-        "Institucion_Educativa_IA", "Rol", "JSON_Respuestas", "Estado", 
+        "ID_Encuesta", "Fecha_Carga", "Tipo_Formulario", "Municipio",
+        "Institucion_Educativa_IA", "Rol", "JSON_Respuestas", "Estado",
         "Foto_P1_Base64", "Foto_P2_Base64", "Verificado_Por"
     ]
-    
+
     if sh is None:
         return pd.DataFrame(columns=expected_cols)
-        
+
     try:
         ws = sh.worksheet("Cola_Revision")
         all_rows = ws.get_all_values()
-        
+
         if not all_rows or len(all_rows) < 2:
             return pd.DataFrame(columns=expected_cols)
-            
-        headers = [h.strip() for h in all_rows[0]]
-        rows = all_rows[1:]
-        
-        # Eliminar columnas fantasma sin nombre al final (muy común en gspread)
-        last_non_empty = len(headers) - 1
-        while last_non_empty >= 0 and headers[last_non_empty] == "":
-            last_non_empty -= 1
-        if last_non_empty >= 0:
-            headers = headers[:last_non_empty + 1]
-            
-        records = []
-        for row in rows:
-            # Asegurar alineación: rellenar celdas faltantes si la fila es corta
-            row_padded = row[:len(headers)] + [""] * (len(headers) - len(row))
-            records.append(dict(zip(headers, row_padded)))
-            
-        df = pd.DataFrame(records)
-        
-        # Sanitizar y asegurar que todas las columnas críticas existan en el DataFrame
-        for col in expected_cols:
-            if col not in df.columns:
-                df[col] = ""
-                
-        return df
+
+        return construir_dataframe_hoja(all_rows, expected_cols)
+
     except Exception as e:
         st.error(f"Error al cargar Cola_Revision de Google Sheets: {e}")
         return pd.DataFrame(columns=expected_cols)
@@ -174,45 +229,26 @@ def cargar_respuestas_validadas():
     """Carga de forma segura las respuestas definitivas aprobadas."""
     sh = obtener_hoja_calculo()
     expected_cols = [
-        "ID_Encuesta", "Tipo_Formulario", "Fecha", "Municipio", 
-        "Institucion_Educativa_Verificada", "Rol", 
+        "ID_Encuesta", "Tipo_Formulario", "Fecha", "Municipio",
+        "Institucion_Educativa_Verificada", "Rol",
         "Conocimientos_P1", "Conocimientos_P2", "Conocimientos_P3", "Conocimientos_P4",
         "Conocimientos_P5", "Conocimientos_P6", "Conocimientos_P7", "Conocimientos_P8",
         "Sat_P1", "Sat_P2", "Sat_P3", "Sat_P4", "Sat_P5", "Sat_P6", "Sat_P7", "Sat_P8", "Sat_P9",
         "Verificado_Por", "Fecha_Aprobacion"
     ]
-    
+
     if sh is None:
         return pd.DataFrame(columns=expected_cols)
-        
+
     try:
         ws = sh.worksheet("Respuestas_SRPA")
         all_rows = ws.get_all_values()
-        
+
         if not all_rows or len(all_rows) < 2:
             return pd.DataFrame(columns=expected_cols)
-            
-        headers = [h.strip() for h in all_rows[0]]
-        rows = all_rows[1:]
-        
-        last_non_empty = len(headers) - 1
-        while last_non_empty >= 0 and headers[last_non_empty] == "":
-            last_non_empty -= 1
-        if last_non_empty >= 0:
-            headers = headers[:last_non_empty + 1]
-            
-        records = []
-        for row in rows:
-            row_padded = row[:len(headers)] + [""] * (len(headers) - len(row))
-            records.append(dict(zip(headers, row_padded)))
-            
-        df = pd.DataFrame(records)
-        
-        for col in expected_cols:
-            if col not in df.columns:
-                df[col] = ""
-                
-        return df
+
+        return construir_dataframe_hoja(all_rows, expected_cols)
+
     except Exception as e:
         st.error(f"Error al cargar Respuestas_SRPA de Google Sheets: {e}")
         return pd.DataFrame(columns=expected_cols)
@@ -220,100 +256,153 @@ def cargar_respuestas_validadas():
 # -----------------------------------------------------------------------------
 # GUARDADO Y CONFIRMACIÓN DE DOBLE VÍA (Inmune a fallos de retraso de Google)
 # -----------------------------------------------------------------------------
+def _buscar_fila_por_id(ws, id_encuesta):
+    """Devuelve el número de fila real en Sheets para un ID, ignorando espacios invisibles."""
+    id_normalizado = normalizar_texto(id_encuesta)
+    all_rows = ws.get_all_values()
+
+    if not all_rows:
+        return None, None, None
+
+    headers = [normalizar_texto(h) for h in all_rows[0]]
+    headers_norm = [normalizar_encabezado(h) for h in headers]
+    idx_id = headers_norm.index(normalizar_encabezado("ID_Encuesta")) if normalizar_encabezado("ID_Encuesta") in headers_norm else 0
+
+    for sheet_row, row in enumerate(all_rows[1:], start=2):
+        if idx_id < len(row) and normalizar_texto(row[idx_id]) == id_normalizado:
+            return sheet_row, headers, row
+
+    return None, headers, None
+
+
+def _actualizar_estado_cola(ws_cola, id_encuesta, estado, usuario_revisor):
+    """Actualiza Estado y Verificado_Por en una única operación."""
+    sheet_row, headers, _ = _buscar_fila_por_id(ws_cola, id_encuesta)
+    if sheet_row is None:
+        return False
+
+    headers_norm = [normalizar_encabezado(h) for h in headers]
+    try:
+        col_estado = headers_norm.index(normalizar_encabezado("Estado")) + 1
+        col_verificador = headers_norm.index(normalizar_encabezado("Verificado_Por")) + 1
+    except ValueError:
+        return False
+
+    # update_cells reduce llamadas a Google y evita que una actualización quede a medias.
+    c1 = gspread.utils.rowcol_to_a1(sheet_row, col_estado)
+    c2 = gspread.utils.rowcol_to_a1(sheet_row, col_verificador)
+    ws_cola.update(f"{c1}:{c2}", [[estado, usuario_revisor]], value_input_option="RAW")
+
+    # Confirmación de doble vía.
+    _, _, row_verificada = _buscar_fila_por_id(ws_cola, id_encuesta)
+    if row_verificada is None:
+        return False
+
+    estado_idx = col_estado - 1
+    verificador_idx = col_verificador - 1
+    return (
+        estado_idx < len(row_verificada)
+        and normalizar_encabezado(row_verificada[estado_idx]) == normalizar_encabezado(estado)
+        and verificador_idx < len(row_verificada)
+        and normalizar_texto(row_verificada[verificador_idx]) == normalizar_texto(usuario_revisor)
+    )
+
+
 def aprobar_e_ingresar_registro(id_encuesta, tipo_formulario, fecha, municipio, ie_verificada, rol, conocimientos, satisfaccion, usuario_revisor):
-    """Guarda en Respuestas_SRPA, actualiza Estado='Aprobado' en Cola_Revision y verifica en doble vía."""
+    """
+    Guarda en Respuestas_SRPA y luego marca como Aprobado la fila exacta en Cola_Revision.
+    Evita duplicados si el usuario vuelve a pulsar aprobar después de un error de red.
+    """
     sh = obtener_hoja_calculo()
     if sh is None:
         st.error("No hay conexión con Google Sheets.")
         return False
-        
+
     try:
         ws_respuestas = sh.worksheet("Respuestas_SRPA")
         ws_cola = sh.worksheet("Cola_Revision")
-        
-        # 1. Preparar fila oficial alineada
-        fila_nueva = [
-            id_encuesta,
-            tipo_formulario,
-            fecha,
-            municipio,
-            ie_verificada,
-            rol,
-            conocimientos.get("p1", ""),
-            conocimientos.get("p2", ""),
-            conocimientos.get("p3", ""),
-            conocimientos.get("p4", ""),
-            conocimientos.get("p5", ""),
-            conocimientos.get("p6", ""),
-            conocimientos.get("p7", ""),
-            conocimientos.get("p8", ""),
-            satisfaccion.get("sat_p1", ""),
-            satisfaccion.get("sat_p2", ""),
-            satisfaccion.get("sat_p3", ""),
-            satisfaccion.get("sat_p4", ""),
-            satisfaccion.get("sat_p5", ""),
-            satisfaccion.get("sat_p6", ""),
-            satisfaccion.get("sat_p7", ""),
-            satisfaccion.get("sat_p8", ""),
-            satisfaccion.get("sat_p9", ""),
-            usuario_revisor,
-            datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        ]
-        
-        # Guardar en base definitiva
-        res = ws_respuestas.append_row(fila_nueva)
-        if not res:
-            st.error("Fallo al escribir en la hoja Respuestas_SRPA.")
+
+        id_encuesta = normalizar_texto(id_encuesta)
+
+        # 1. Evitar duplicar el registro definitivo si ya fue ingresado.
+        fila_existente, _, _ = _buscar_fila_por_id(ws_respuestas, id_encuesta)
+        if fila_existente is None:
+            fila_nueva = [
+                id_encuesta,
+                normalizar_texto(tipo_formulario).upper(),
+                normalizar_texto(fecha),
+                normalizar_texto(municipio),
+                normalizar_texto(ie_verificada),
+                normalizar_texto(rol),
+                normalizar_texto(conocimientos.get("p1", "")),
+                normalizar_texto(conocimientos.get("p2", "")),
+                normalizar_texto(conocimientos.get("p3", "")),
+                normalizar_texto(conocimientos.get("p4", "")),
+                normalizar_texto(conocimientos.get("p5", "")),
+                normalizar_texto(conocimientos.get("p6", "")),
+                normalizar_texto(conocimientos.get("p7", "")),
+                normalizar_texto(conocimientos.get("p8", "")),
+                normalizar_texto(satisfaccion.get("sat_p1", "")),
+                normalizar_texto(satisfaccion.get("sat_p2", "")),
+                normalizar_texto(satisfaccion.get("sat_p3", "")),
+                normalizar_texto(satisfaccion.get("sat_p4", "")),
+                normalizar_texto(satisfaccion.get("sat_p5", "")),
+                normalizar_texto(satisfaccion.get("sat_p6", "")),
+                normalizar_texto(satisfaccion.get("sat_p7", "")),
+                normalizar_texto(satisfaccion.get("sat_p8", "")),
+                normalizar_texto(satisfaccion.get("sat_p9", "")),
+                normalizar_texto(usuario_revisor),
+                datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            ]
+
+            res = ws_respuestas.append_row(
+                fila_nueva,
+                value_input_option="RAW",
+                insert_data_option="INSERT_ROWS",
+                include_values_in_response=True
+            )
+
+            if not res:
+                st.error("Fallo al escribir en la hoja Respuestas_SRPA.")
+                return False
+
+            # Confirmar inmediatamente que Google realmente guardó el ID.
+            fila_verificada, _, _ = _buscar_fila_por_id(ws_respuestas, id_encuesta)
+            if fila_verificada is None:
+                st.error("Google Sheets no confirmó la escritura en Respuestas_SRPA.")
+                return False
+
+        # 2. Actualizar la misma encuesta en la cola.
+        if not _actualizar_estado_cola(
+            ws_cola, id_encuesta, "Aprobado", normalizar_texto(usuario_revisor)
+        ):
+            st.error(
+                "La respuesta definitiva quedó guardada, pero no se pudo actualizar "
+                "la encuesta correspondiente en Cola_Revision."
+            )
             return False
-            
-        # 2. Localizar y actualizar el registro en la Cola_Revision
-        all_rows_cola = ws_cola.get_all_values()
-        encontrado = False
-        
-        for idx, row in enumerate(all_rows_cola):
-            if idx == 0:
-                continue
-            # Asegurar que comparamos correctamente el ID de la encuesta en la Columna A
-            if len(row) > 0 and row[0].strip() == id_encuesta.strip():
-                # Encontrar columna 'Estado'
-                headers = [h.strip() for h in all_rows_cola[0]]
-                if "Estado" in headers:
-                    col_estado_idx = headers.index("Estado") + 1
-                    ws_cola.update_cell(idx + 1, col_estado_idx, "Aprobado")
-                if "Verificado_Por" in headers:
-                    col_verificador_idx = headers.index("Verificado_Por") + 1
-                    ws_cola.update_cell(idx + 1, col_verificador_idx, usuario_revisor)
-                encontrado = True
-                break
-                
+
         return True
+
     except Exception as e:
         st.error(f"Fallo durante la aprobación del registro: {e}")
         return False
 
+
 def rechazar_registro_cola(id_encuesta, usuario_revisor):
-    """Marca un registro en la Cola_Revision como 'Rechazado' de forma segura."""
+    """Marca un registro en la Cola_Revision como 'Rechazado'."""
     sh = obtener_hoja_calculo()
     if sh is None:
         return False
-        
+
     try:
         ws_cola = sh.worksheet("Cola_Revision")
-        all_rows_cola = ws_cola.get_all_values()
-        
-        for idx, row in enumerate(all_rows_cola):
-            if idx == 0:
-                continue
-            if len(row) > 0 and row[0].strip() == id_encuesta.strip():
-                headers = [h.strip() for h in all_rows_cola[0]]
-                if "Estado" in headers:
-                    col_estado_idx = headers.index("Estado") + 1
-                    ws_cola.update_cell(idx + 1, col_estado_idx, "Rechazado")
-                if "Verificado_Por" in headers:
-                    col_verificador_idx = headers.index("Verificado_Por") + 1
-                    ws_cola.update_cell(idx + 1, col_verificador_idx, usuario_revisor)
-                return True
-        return False
+        return _actualizar_estado_cola(
+            ws_cola,
+            normalizar_texto(id_encuesta),
+            "Rechazado",
+            normalizar_texto(usuario_revisor)
+        )
     except Exception as e:
         st.error(f"Error al rechazar el registro: {e}")
         return False
@@ -523,20 +612,60 @@ def main():
             col_m1, col_m2, col_m3 = st.columns(3)
             with col_m1:
                 st.metric("Total Registros Filtrados", len(df_filtrado))
+            tipo_normalizado = df_filtrado["Tipo_Formulario"].map(normalizar_encabezado)
+            pretest_count = int((tipo_normalizado == "pretest").sum())
+            posttest_count = int((tipo_normalizado == "postest").sum())
+
             with col_m2:
-                pretest_count = len(df_filtrado[df_filtrado["Tipo_Formulario"] == "PRETEST"])
                 st.metric("Total Pretest", pretest_count)
             with col_m3:
-                posttest_count = len(df_filtrado[df_filtrado["Tipo_Formulario"] == "POSTEST"])
                 st.metric("Total Postest", posttest_count)
                 
             # Gráficos de Satisfacción si existen Postest
             if posttest_count > 0:
                 import plotly.express as px
+
                 st.subheader("Evaluación de Satisfacción de las Jornadas (Postest)")
-                # Gráfico sencillo de barras acumulado
-                # Nota: En producción, aquí se mapearían los valores de Sat_P1 a Sat_P9
-                st.write("Estadísticas de satisfacción consolidadas de forma real en la base de datos.")
+
+                columnas_sat = [
+                    "Sat_P1", "Sat_P2", "Sat_P3", "Sat_P4", "Sat_P5",
+                    "Sat_P6", "Sat_P7", "Sat_P8", "Sat_P9"
+                ]
+
+                registros_sat = []
+                for columna in columnas_sat:
+                    if columna not in df_filtrado.columns:
+                        continue
+                    valores = (
+                        df_filtrado[columna]
+                        .map(normalizar_texto)
+                        .replace("", pd.NA)
+                        .dropna()
+                    )
+                    for valor in valores:
+                        registros_sat.append({
+                            "Pregunta": columna.replace("Sat_", "Pregunta "),
+                            "Valoración": valor
+                        })
+
+                if registros_sat:
+                    df_sat = pd.DataFrame(registros_sat)
+                    grafico = (
+                        df_sat.groupby(["Pregunta", "Valoración"])
+                        .size()
+                        .reset_index(name="Cantidad")
+                    )
+                    fig = px.bar(
+                        grafico,
+                        x="Pregunta",
+                        y="Cantidad",
+                        color="Valoración",
+                        barmode="group",
+                        text_auto=True
+                    )
+                    st.plotly_chart(fig, use_container_width=True)
+                else:
+                    st.info("Hay postest aprobados, pero todavía no hay valores de satisfacción registrados.")
                 
     # -------------------------------------------------------------------------
     # PESTAÑA 2: CARGA EN CAMPO (Cámara móvil / Galería)
@@ -586,9 +715,31 @@ def main():
                             usuario
                         ]
                         
-                        ws_cola.append_row(fila_cola)
-                        st.success(f"✅ Encuesta subida y encolada exitosamente para revisión. ID: {id_encuesta}")
-                        st.info("Ve a la pestaña **Banco de Verificación** para corregir el nombre y aprobarla.")
+                        try:
+                            ws_cola.append_row(
+                                fila_cola,
+                                value_input_option="RAW",
+                                insert_data_option="INSERT_ROWS",
+                                include_values_in_response=True
+                            )
+
+                            # Confirmar que el registro se puede volver a localizar inmediatamente.
+                            fila_confirmada, _, _ = _buscar_fila_por_id(ws_cola, id_encuesta)
+                            if fila_confirmada is None:
+                                st.error(
+                                    "La encuesta fue enviada a Google Sheets, pero no se pudo "
+                                    "confirmar su presencia en Cola_Revision. No se marcará como exitosa."
+                                )
+                            else:
+                                st.success(
+                                    f"✅ Encuesta subida y encolada exitosamente para revisión. ID: {id_encuesta}"
+                                )
+                                st.info(
+                                    "La encuesta ya está en Cola_Revision. Ve a la pestaña "
+                                    "**Banco de Verificación** para corregir el nombre y aprobarla."
+                                )
+                        except Exception as e:
+                            st.error(f"Error al guardar la encuesta en Cola_Revision: {e}")
                     else:
                         st.error("Error al procesar la encuesta con Gemini. Por favor, asegúrate de tener una conexión estable y una GEMINI_API_KEY válida.")
                         
@@ -599,10 +750,23 @@ def main():
         st.subheader("🔍 Banco de Verificación de Escritura a Mano")
         st.write("Verifica y corrige el nombre de la Institución Educativa manuscrita antes de guardarla permanentemente.")
         
+        col_refresh, _ = st.columns([1, 5])
+        with col_refresh:
+            if st.button("🔄 Actualizar cola", use_container_width=True):
+                st.rerun()
+
         df_cola = cargar_cola_revision()
         
-        # Filtrar registros en Estado "Pendiente"
-        df_pendientes = df_cola[df_cola["Estado"].astype(str).str.strip().str.upper() == "PENDIENTE"]
+        # Filtrar registros en Estado "Pendiente" tolerando espacios/carácteres invisibles.
+        if not df_cola.empty:
+            df_cola["_Estado_Normalizado"] = df_cola["Estado"].map(normalizar_encabezado)
+            df_cola["_ID_Normalizado"] = df_cola["ID_Encuesta"].map(normalizar_texto)
+            df_pendientes = df_cola[
+                (df_cola["_Estado_Normalizado"] == "pendiente")
+                & (df_cola["_ID_Normalizado"] != "")
+            ].copy()
+        else:
+            df_pendientes = df_cola.copy()
         
         if df_pendientes.empty:
             st.info("🎉 **¡Excelente trabajo! No hay encuestas pendientes de verificación en la cola de revisión.**")
@@ -664,7 +828,7 @@ def main():
                 st.write("📋 **Respuestas leídas de la encuesta:**")
                 st.write(data_json.get("conocimientos", {}))
                 
-                if row['Tipo_Formulario'] == "POSTEST":
+                if normalizar_encabezado(row['Tipo_Formulario']) == "postest":
                     st.write("📊 **Respuestas de satisfacción:**")
                     st.write(data_json.get("satisfaccion", {}))
                     
