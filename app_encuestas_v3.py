@@ -118,7 +118,7 @@ def init_google_sheets():
         except gspread.exceptions.WorksheetNotFound:
             ws_cola = spreadsheet.add_worksheet(title="Cola_Revision", rows="1000", cols="10")
             headers = ["ID_Encuesta", "Fecha_Carga", "Tipo_Formulario", "Municipio", "Institucion_Educativa_IA", "Rol", "JSON_Respuestas", "Estado", "Img_Pag1_Base64", "Img_Pag2_Base64"]
-            ws_cola.append_row(headers)
+            ws_cola.update('A1:J1', [headers])
 
         # Ensure Respuestas_SRPA worksheet exists
         try:
